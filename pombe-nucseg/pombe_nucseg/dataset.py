@@ -11,11 +11,13 @@ without you having to annotate thousands of them.
 
 from __future__ import annotations
 
+import warnings
 from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy import ndimage as ndi
+from skimage.measure import regionprops
 
 from .config import DatasetConfig
 
@@ -24,6 +26,7 @@ __all__ = [
     "build_crops",
     "assign_weights",
     "weight_report",
+    "suggest_manual_multiplier",
     "apply_manual_overrides",
     "save_dataset",
     "load_dataset",
@@ -150,20 +153,39 @@ def build_crops(
             ch = _normalize(ch, cfg)
             if cfg.include_cell_mask_channel:
                 ch = np.concatenate([ch, cm[None].astype(np.float32)], axis=0)
+            cmb = cm > 0.5
+            clipped = bool(cmb[0].any() or cmb[-1].any()
+                           or cmb[:, 0].any() or cmb[:, -1].any())
             Xs.append(ch)
             Ys.append((nm > 0.5).astype(np.float32)[None])
             metas.append({
                 "position": r.position, "frame": r.frame, "cell_id": r.cell_id,
                 "condition": r.condition, "source": r.source,
+                "split_borderline": bool(getattr(r, "split_borderline", False)),
                 "cell_area_um2": r.cell_area_um2,
                 "nuc_area_um2": r.nuc_area_um2,
+                "cell_clipped": clipped,
             })
 
     if not Xs:
         raise ValueError("no crops produced - check qc_pass and frame indices")
+    meta = pd.DataFrame(metas)
+    n_clip = int(meta["cell_clipped"].sum())
+    if n_clip:
+        # A cell that does not fit the crop loses its tips - and in anaphase
+        # the daughter nuclei are at the tips. Those pixels are silently
+        # absent from the label and can never be predicted at inference.
+        max_len = float(table.loc[table["qc_pass"], "cell_length_um"].max()) \
+            if "cell_length_um" in table.columns else float("nan")
+        warnings.warn(
+            f"{n_clip}/{len(meta)} cells touch the crop border (crop_size="
+            f"{cfg.crop_size}, longest qc-pass cell {max_len:.1f} um). "
+            "Increase DatasetConfig.crop_size so crop_size * pixel_size >= "
+            "longest cell + 2 * crop_pad_um, or drop these cells "
+            "(meta['cell_clipped']).", stacklevel=2)
     return (np.stack(Xs).astype(np.float32),
             np.stack(Ys).astype(np.float32),
-            pd.DataFrame(metas))
+            meta)
 
 
 # --------------------------------------------------------------------------
@@ -176,7 +198,12 @@ def assign_weights(meta: pd.DataFrame, cfg: DatasetConfig) -> pd.DataFrame:
     """
     m = meta.copy()
     base = m["condition"].map(cfg.condition_weights).fillna(1.0)
-    mult = np.where(m["source"].eq("manual"), cfg.manual_weight_multiplier, 1.0)
+    manual = m["source"].eq("manual")
+    mult = np.where(manual, cfg.manual_weight_multiplier, 1.0)
+    if "split_borderline" in m.columns:
+        # auto labels whose bridge/two-nuclei call is a thresholding accident
+        mult = np.where(m["split_borderline"].astype(bool) & ~manual,
+                        cfg.borderline_auto_weight, mult)
     m["weight"] = np.minimum(base * mult, cfg.max_sample_weight).astype(float)
 
     total = m["weight"].sum()
@@ -185,13 +212,73 @@ def assign_weights(meta: pd.DataFrame, cfg: DatasetConfig) -> pd.DataFrame:
     return m
 
 
-def weight_report(meta: pd.DataFrame) -> pd.DataFrame:
-    """Raw counts vs weighted exposure, per condition and label source."""
+def weight_report(meta: pd.DataFrame, max_draws_per_sample: float = 3.0,
+                  max_share_ratio: float = 5.0) -> pd.DataFrame:
+    """Raw counts vs weighted exposure, per condition and label source.
+
+    ``draws_per_sample`` is how many times one crop of that group is expected
+    to be drawn per epoch under ``weighting_mode="sampler"`` (and equally its
+    relative loss weight under ``"loss"``). Groups with more than
+    ``max_draws_per_sample``, or whose weighted share exceeds their count share
+    by more than ``max_share_ratio``, get ``flag=True`` and a warning: the
+    model will memorise those crops rather than learn from them.
+    """
     g = meta.groupby(["condition", "source"])
-    out = g.agg(n=("weight", "size"), weight_sum=("weight", "sum"))
-    out["count_share"] = (out["n"] / out["n"].sum()).round(4)
-    out["weighted_share"] = (out["weight_sum"] / out["weight_sum"].sum()).round(4)
-    return out.reset_index()
+    out = g.agg(n=("weight", "size"), weight_sum=("weight", "sum"),
+                w_max=("weight", "max"))
+    N, Wtot = len(meta), float(meta["weight"].sum())
+    out["count_share"] = (out["n"] / N).round(4)
+    out["weighted_share"] = (out["weight_sum"] / Wtot).round(4)
+    out["draws_per_sample"] = (N * out["w_max"] / Wtot).round(2)
+    out["flag"] = ((out["draws_per_sample"] > max_draws_per_sample)
+                   | (out["weighted_share"] > max_share_ratio * out["count_share"]))
+    out = out.drop(columns="w_max").reset_index()
+    bad = out[out["flag"]]
+    if len(bad):
+        warnings.warn(
+            "over-weighted groups (each crop drawn "
+            + ", ".join(f"{r.condition}/{r.source}: {r.draws_per_sample:.1f}x per epoch"
+                        for r in bad.itertuples())
+            + "). Lower manual_weight_multiplier / condition_weights or annotate "
+            "more cells; see suggest_manual_multiplier().", stacklevel=2)
+    return out
+
+
+def suggest_manual_multiplier(meta: pd.DataFrame, cfg: DatasetConfig,
+                              target_manual_share: float = 0.15,
+                              max_draws_per_sample: float = 3.0) -> Dict[str, float]:
+    """Solve for ``manual_weight_multiplier`` instead of guessing it.
+
+    Picks the multiplier that gives manual crops ``target_manual_share`` of the
+    weighted mass, then lowers it if any single crop would be drawn more than
+    ``max_draws_per_sample`` times per epoch. With few annotations the second
+    cap binds and the manual share ends up below target - that is the honest
+    answer: you cannot buy influence for two crops without memorising them,
+    only more annotation raises the share safely.
+    """
+    base = meta["condition"].map(cfg.condition_weights).fillna(1.0).to_numpy()
+    manual = meta["source"].eq("manual").to_numpy()
+    if not manual.any():
+        return {"multiplier": cfg.manual_weight_multiplier, "manual_share": 0.0,
+                "max_draws": 0.0, "n_manual": 0}
+    w_auto = float(base[~manual].sum())
+    w_man_base = float(base[manual].sum())
+    s = target_manual_share
+    mult = s / (1.0 - s) * w_auto / w_man_base
+    # cap: draws of the heaviest manual crop = N * base_max * mult / total
+    N = len(meta)
+    bmax = float(base[manual].max())
+    for _ in range(50):
+        total = w_auto + mult * w_man_base
+        draws = N * bmax * mult / total
+        if draws <= max_draws_per_sample:
+            break
+        mult *= 0.9
+    total = w_auto + mult * w_man_base
+    return {"multiplier": float(mult),
+            "manual_share": float(mult * w_man_base / total),
+            "max_draws": float(N * bmax * mult / total),
+            "n_manual": int(manual.sum())}
 
 
 # --------------------------------------------------------------------------
@@ -199,7 +286,9 @@ def apply_manual_overrides(
     nucleus_labels: np.ndarray,
     table: pd.DataFrame,
     manual_labels: Dict[Tuple[str, int], np.ndarray],
+    cell_labels: Optional[np.ndarray] = None,
     conditions: Optional[Dict[Tuple[str, int, int], str]] = None,
+    position: Optional[str] = None,
 ) -> Tuple[np.ndarray, pd.DataFrame]:
     """Replace auto labels with hand-drawn ones where they exist.
 
@@ -207,45 +296,74 @@ def apply_manual_overrides(
     ID (0 = not annotated). Draw these in napari / QuPath / Fiji on the crops
     the triage step flags; you only need the hard cases.
 
+    ``nucleus_labels`` (and ``cell_labels``) are the stacks for ONE position;
+    pass ``position`` to skip manual images belonging to other positions.
+
+    Every nucleus pixel the auto pipeline wrote inside the cell is cleared
+    before the manual mask is written - including the second daughter, which
+    carries ID ``cell_id + offset``, not ``cell_id``. Without ``cell_labels``
+    the clear falls back to ID arithmetic and the manual mask is not clipped
+    to the cell.
+
     Any cell present in a manual image is overridden, marked ``source="manual"``
     and forced ``qc_pass=True`` - a human looked at it, so the automatic
-    rejections no longer apply.
+    rejections no longer apply. Its condition is re-derived from the drawn
+    mask (component count, then the same aspect / solidity rule as the auto
+    path) unless ``conditions`` supplies one; a hand-drawn dumbbell should not
+    keep an ``interphase`` weight because the auto pass called it that.
     """
+    from .labelgen import _classify
+    from .config import LabelGenConfig
+
     nl = np.array(nucleus_labels, copy=True)
     tb = table.copy()
     tb["source"] = tb["source"].astype(object)
+    lcfg = LabelGenConfig()
 
     for (pos, frame), man in manual_labels.items():
+        if position is not None and pos != position:
+            continue
         man = np.asarray(man)
         ids = np.unique(man)
         ids = ids[ids > 0]
         sel_frame = (tb["position"] == pos) & (tb["frame"] == frame)
+        max_cid = int(tb.loc[sel_frame, "cell_id"].max()) if sel_frame.any() else 0
+        offset = 10 ** int(np.ceil(np.log10(max_cid + 1))) if max_cid else 1000
         for cid in ids:
+            cid = int(cid)
             m = man == cid
+            if cell_labels is not None:
+                cell = cell_labels[frame] == cid
+                outside = int((m & ~cell).sum())
+                if outside:
+                    warnings.warn(f"manual nucleus {pos}/{frame}/{cid}: {outside} px "
+                                  "outside the cell mask were dropped", stacklevel=2)
+                m = m & cell
+                nl[frame][cell] = 0                 # every auto id in this cell
+            else:
+                ids_here = np.unique(nl[frame])
+                mine = [i for i in ids_here if i > 0 and i % offset == cid]
+                nl[frame][np.isin(nl[frame], mine)] = 0
             nl[frame][m] = cid
-            # clear any auto pixels for this cell that fall outside the manual mask
-            stale = (nl[frame] == cid) & (~m)
-            nl[frame][stale] = 0
 
             sel = sel_frame & (tb["cell_id"] == cid)
             if not sel.any():
+                warnings.warn(f"manual nucleus {pos}/{frame}/{cid} has no row in the "
+                              "table; its pixels were written but build_crops will "
+                              "not see it", stacklevel=2)
                 continue
-            cond = None
-            if conditions is not None:
-                cond = conditions.get((pos, frame, int(cid)))
+            cond = conditions.get((pos, frame, cid)) if conditions is not None else None
+            if cond is None:
+                comp, n_comp = ndi.label(m)
+                props = sorted(regionprops(comp), key=lambda q: q.area, reverse=True)
+                cond = _classify(props, lcfg, neck=0.0) if props else "reject"
             tb.loc[sel, "source"] = "manual"
-            tb.loc[sel, "qc_pass"] = True
-            tb.loc[sel, "reject_reason"] = ""
+            tb.loc[sel, "qc_pass"] = bool(m.any())
+            tb.loc[sel, "reject_reason"] = "" if m.any() else "manual_empty"
             tb.loc[sel, "nuc_area_px"] = float(m.sum())
-            if cond is not None:
-                tb.loc[sel, "condition"] = cond
-            elif (tb.loc[sel, "condition"] == "reject").any():
-                # a human annotated a cell the pipeline rejected; label it
-                # from the component count so it is not silently dropped
-                n_comp = ndi.label(m)[1]
-                tb.loc[sel, "condition"] = (
-                    "two_nuclei" if n_comp >= 2 else "anaphase_bridge"
-                )
+            tb.loc[sel, "condition"] = cond
+            if "split_borderline" in tb.columns:
+                tb.loc[sel, "split_borderline"] = False
     return nl, tb
 
 

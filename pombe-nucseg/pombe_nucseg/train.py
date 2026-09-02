@@ -9,7 +9,10 @@ Two ways to make rare, manually corrected anaphase cells count:
   weighting_mode="loss"     Uniform sampling, per-sample loss scaling. Keeps
                             the epoch a true pass over the data, but a weight
                             of 24 on one crop produces a correspondingly large
-                            gradient step.
+                            gradient step (``grad_clip`` bounds it). Weights
+                            are normalised by the mean weight of the training
+                            set, a constant, so a sample's influence does not
+                            depend on which batch it lands in.
 
   weighting_mode="both"     Effects multiply. Rarely what you want.
 
@@ -31,13 +34,14 @@ from .model import build_unet, count_parameters
 
 # --------------------------------------------------------------------------
 def make_dataloaders(X, Y, weights, train_idx, val_idx, cfg: TrainConfig,
-                     augment: bool = True):
+                     augment: bool = True, mask_channel: bool = True):
     import torch
     from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
     class CropDS(Dataset):
-        def __init__(self, X, Y, w, idx, aug):
+        def __init__(self, X, Y, w, idx, aug, mask_ch):
             self.X, self.Y, self.w, self.idx, self.aug = X, Y, w, idx, aug
+            self.mask_ch = mask_ch
 
         def __len__(self):
             return len(self.idx)
@@ -54,15 +58,18 @@ def make_dataloaders(X, Y, weights, train_idx, val_idx, cfg: TrainConfig,
                     x, y = x[:, ::-1], y[:, ::-1]
                 if np.random.rand() < 0.5:
                     x, y = x[..., ::-1], y[..., ::-1]
-                x = x * np.float32(np.random.uniform(0.9, 1.1))
-                x = x + np.float32(np.random.normal(0, 0.02))
+                # intensity jitter on image planes only - the cell-mask
+                # channel is exactly {0, 1} at inference and must stay so
+                nimg = x.shape[0] - 1 if self.mask_ch else x.shape[0]
+                x[:nimg] = x[:nimg] * np.float32(np.random.uniform(0.9, 1.1))
+                x[:nimg] = x[:nimg] + np.float32(np.random.normal(0, 0.02))
             return (torch.from_numpy(np.ascontiguousarray(x)),
                     torch.from_numpy(np.ascontiguousarray(y)),
                     torch.tensor(float(self.w[j])))
 
     w = np.asarray(weights, dtype=np.float64)
-    tr = CropDS(X, Y, w, train_idx, augment)
-    va = CropDS(X, Y, w, val_idx, False) if len(val_idx) else None
+    tr = CropDS(X, Y, w, train_idx, augment, mask_channel)
+    va = CropDS(X, Y, w, val_idx, False, mask_channel) if len(val_idx) else None
 
     if cfg.weighting_mode in ("sampler", "both"):
         sampler = WeightedRandomSampler(
@@ -80,10 +87,19 @@ def make_dataloaders(X, Y, weights, train_idx, val_idx, cfg: TrainConfig,
 
 
 # --------------------------------------------------------------------------
-def _loss_fn(logits, target, sample_w, cfg: TrainConfig):
+def _loss_fn(logits, target, sample_w, cfg: TrainConfig, w_norm: float = 1.0):
+    """BCE + soft Dice per sample, optionally scaled by ``sample_w / w_norm``.
+
+    ``w_norm`` must be a constant (the mean training weight). Normalising by
+    the *batch* mean makes a batch of only high-weight crops indistinguishable
+    from a batch of only low-weight ones, and gives an interphase crop 0.26x
+    or 1.0x depending on whether a manual crop shares its batch.
+    """
     import torch
     import torch.nn.functional as F
 
+    logits = logits.float()          # dice sums in fp16 lose precision under AMP
+    target = target.float()
     pos_weight = (torch.tensor(cfg.pos_weight, device=logits.device)
                   if cfg.pos_weight else None)
     bce = F.binary_cross_entropy_with_logits(
@@ -98,8 +114,7 @@ def _loss_fn(logits, target, sample_w, cfg: TrainConfig):
 
     per_sample = bce + cfg.dice_weight * dice
     if cfg.weighting_mode in ("loss", "both"):
-        w = sample_w / sample_w.mean().clamp(min=1e-6)   # keep scale ~1
-        per_sample = per_sample * w
+        per_sample = per_sample * (sample_w.float() / max(float(w_norm), 1e-6))
     return per_sample.mean()
 
 
@@ -135,9 +150,14 @@ def train_model(
     np.random.seed(cfg.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    if len(meta) != len(X):
+        raise ValueError(f"meta has {len(meta)} rows but X has {len(X)} crops; "
+                         "they must be positionally aligned")
     weights = meta["weight"].to_numpy() if "weight" in meta.columns \
         else np.ones(len(meta))
-    tl, vl = make_dataloaders(X, Y, weights, train_idx, val_idx, cfg)
+    w_norm = float(np.mean(weights[train_idx])) if len(train_idx) else 1.0
+    tl, vl = make_dataloaders(X, Y, weights, train_idx, val_idx, cfg,
+                              mask_channel=(X.shape[1] > 1))
 
     model = build_unet(cfg.in_channels, cfg.base_filters, cfg.depth).to(device)
     if verbose:
@@ -148,17 +168,25 @@ def train_model(
                             weight_decay=cfg.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs)
     use_amp = cfg.amp and device == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    best, history = -1.0, []
+    # -inf, not -1: with no validation set the score is -loss, and BCE+Dice
+    # starts above 1, so nothing was checkpointed until loss < 1 - and a
+    # stale file from an earlier run would then be loaded instead.
+    best, history = -np.inf, []
     for epoch in range(cfg.epochs):
         running = 0.0
         for x, y, w in tl:
             x, y, w = x.to(device), y.to(device), w.to(device)
             opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                loss = _loss_fn(model(x), y, w, cfg)
+            with torch.autocast(device_type="cuda", dtype=torch.float16,
+                                enabled=use_amp):
+                logits = model(x)
+            loss = _loss_fn(logits, y, w, cfg, w_norm)
             scaler.scale(loss).backward()
+            if cfg.grad_clip and cfg.grad_clip > 0:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             scaler.step(opt)
             scaler.update()
             running += loss.item()
@@ -191,6 +219,8 @@ def evaluate_by_condition(model, X, Y, meta: pd.DataFrame, idx,
                           batch_size: int = 64) -> pd.DataFrame:
     """Per-condition IoU on a held-out index set - the number that matters."""
     import torch
+    if len(meta) != len(X):
+        raise ValueError(f"meta has {len(meta)} rows but X has {len(X)} crops")
     device = next(model.parameters()).device
     model.eval()
     rows = []

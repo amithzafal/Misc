@@ -69,6 +69,29 @@ dumbbell and pinches, so:
 decides where the bridge breaks, which is arbitrary. That is the argument for
 hand-labelling those cases and weighting them up.
 
+The bridge / two-nuclei call itself is no longer left to Otsu alone. Every
+cell gets `nuc_neck_ratio`: the GFP intensity at the saddle between the two
+brightest maxima divided by the dimmer maximum (1.0 = one blob, 0.0 = fully
+separated), found by binary-searching the threshold at which the two maxima
+join. It is threshold-free and, on synthetic dumbbells, varies smoothly with
+bridge intensity (sd ≈ 0.01) while the Otsu component count flips under a
+±20 % threshold change. Cells whose neck ratio falls in
+`LabelGenConfig.neck_borderline` (default 0.25–0.6, where Otsu flips) are
+marked `split_borderline`; two Otsu components with a neck ratio above the
+band are called `anaphase_bridge`, because the threshold cut them, not
+biology. Borderline auto labels are down-weighted in training
+(`DatasetConfig.borderline_auto_weight`) and ranked first for annotation.
+
+Bleed-through guards: a non-expressing cell next to a bright one passes the
+SNR gate easily (haze from the neighbour is far above background noise) and
+Otsu then draws a "nucleus" hugging the shared boundary — worse than no
+label. Two extra gates reject that: `min_nuc_cyto_ratio` (nucleus vs rest of
+cell contrast) and `max_outside_ratio` (signal just outside the cell next to
+the nucleus, relative to the nucleus; a real nucleus sits ≥ 1 µm inside the
+cortex so that ring is empty or at background). Rejections show up as
+`low_nuc_contrast` / `edge_bleed`. Two nuclei of very different size are
+rejected as `asymmetric_nuclei` — pombe divides symmetrically.
+
 ## Weighting manual and anaphase labels
 
 ```python
@@ -81,13 +104,29 @@ meta = assign_weights(meta, dcfg)
 print(weight_report(meta))
 ```
 
-`weight = condition_weight × manual_multiplier`, capped.
+`weight = condition_weight × manual_multiplier`, capped; auto labels flagged
+`split_borderline` get `borderline_auto_weight` instead of the multiplier.
 
-**Always read `weight_report` before training.** In a test run, 2 manually
-labelled anaphase crops out of 90 samples (2.2% by count) took 22% of the
-weighted mass. That is probably too much — the model will memorise those two
-crops. Two knobs to fix it: lower `manual_weight_multiplier`, or annotate more
-cells. Annotating more is better.
+**Always read `weight_report` before training.** It now prints
+`draws_per_sample` — how often one crop of each group is drawn per epoch under
+the sampler (equally, its relative loss weight under `"loss"`) — and warns
+when that exceeds 3 or a group's weighted share is more than 5× its count
+share. In a test run, 2 manually labelled anaphase crops out of 90 samples
+(2.2% by count) took 22% of the weighted mass, i.e. each was drawn ~10× per
+epoch with only flips for augmentation: memorisation. Do not guess the
+multiplier, solve for it:
+
+```python
+from pombe_nucseg.dataset import suggest_manual_multiplier
+suggest_manual_multiplier(meta, dcfg, target_manual_share=0.15, max_draws_per_sample=3)
+```
+
+gives the multiplier that puts manual crops at 15% of the weighted mass, then
+lowers it until no single crop is drawn more than 3× per epoch. With a
+handful of annotations the second cap binds and the share stays well below
+target — that is the honest answer; only more annotation buys influence
+safely. With ~300 manual cells in ~20k crops the target is reachable at a
+multiplier of ~2–3.
 
 `TrainConfig.weighting_mode` controls how weights enter training:
 
@@ -105,11 +144,15 @@ from pombe_nucseg.infer import rank_for_annotation
 rank_for_annotation(table, baseline_metrics, n=200).to_csv("to_annotate.csv")
 ```
 
-Ranks by: anaphase bridges, cells the pipeline rejected despite good GFP
-signal (real failure modes), largest disagreement with the geometric baseline,
-borderline two-nucleus calls. Draw those in napari/Fiji, feed back through
-`apply_manual_overrides`. A few hundred well-chosen cells beats a few thousand
-random ones.
+Ranks by: anaphase bridges, `split_borderline` calls, cells the pipeline
+rejected despite good GFP signal (real failure modes), largest disagreement
+with the geometric baseline. Pass `frame_stride` to thin consecutive frames of
+the same dividing cell. Draw those in napari/Fiji, feed back through
+`apply_manual_overrides(nuc_labels, table, manual, cell_labels=cells)` — pass
+the cell masks so every auto pixel in the cell (including the second daughter,
+which carries `cell_id + offset`) is cleared before the manual mask is written.
+The condition is re-derived from the drawn mask. A few hundred well-chosen
+cells beats a few thousand random ones.
 
 ## Plugging in real data
 
@@ -124,6 +167,16 @@ cells = tifffile.imread("pos01_cellmasks.tif")# (T, H, W) int instance labels
 
 Then set `LabelGenConfig(pixel_size_um=...)` to your actual calibration —
 several defaults (minimum nuclear area, smoothing, erosion) are derived from it.
+
+**Crop size is in pixels, not microns.** At 0.065 µm/px (6.5 µm sCMOS pixels
+at 100×) a 14 µm cell is 215 px and does not fit a 128 px crop; anaphase
+daughters sit at the tips, so their pixels would be missing from the label and
+unpredictable at inference. `build_crops` warns and sets `meta["cell_clipped"]`
+when a cell touches the crop border; set `crop_size` so that
+`crop_size × pixel_size ≥ longest cell + 2 µm`.
+
+At inference there is no GFP table: `predict_movie(model, bf, cells, None, dcfg)`
+derives centroid and orientation from the cell masks.
 
 ### Things to check on real data that synthetic data cannot tell you
 
@@ -168,8 +221,7 @@ catches the per-frame dropouts a frame-independent model will produce.
 
 ## Status
 
-`labelgen`, `validate`, `dataset`, `synthetic` are tested end to end on
-synthetic frames. `model`, `train`, `infer` are compile-checked but were not
-run — torch would not install in the environment where this was written. Run
-`python run_pipeline.py --train` once locally to shake out anything in the
-training path before pointing it at real data.
+All modules have been run end to end on synthetic frames, including
+`model`, `train` and `infer` (CPU torch 2.14). The U-Net at
+`base_filters=16, depth=4` has 1.94 M parameters, not ~1 M. See `REVIEW.md`
+for what was found and changed.

@@ -16,7 +16,26 @@ from scipy import ndimage as ndi
 from .config import DatasetConfig
 from .dataset import extract_cell_crop, _normalize
 
-__all__ = ["load_model", "predict_frame", "predict_movie", "rank_for_annotation"]
+__all__ = ["load_model", "cell_table_from_masks", "predict_frame",
+           "predict_movie", "rank_for_annotation"]
+
+
+def cell_table_from_masks(cell_labels, position: str = "pos0") -> pd.DataFrame:
+    """Per-cell geometry from cell masks alone - what inference needs.
+
+    At inference there is no GFP and therefore no label table; the only
+    columns ``predict_frame`` uses are the cell centroid and orientation, and
+    those come from the masks.
+    """
+    from skimage.measure import regionprops
+    rows = []
+    for t in range(len(cell_labels)):
+        for p in regionprops(np.asarray(cell_labels[t])):
+            rows.append(dict(position=position, frame=t, cell_id=int(p.label),
+                             cell_y=float(p.centroid[0]), cell_x=float(p.centroid[1]),
+                             cell_orientation=float(p.orientation),
+                             cell_length_um=np.nan, qc_pass=True))
+    return pd.DataFrame(rows)
 
 
 def load_model(checkpoint: str, in_channels: int = 2, base: int = 16,
@@ -110,9 +129,12 @@ def predict_frame(model, brightfield: np.ndarray, cell_labels: np.ndarray,
     return out
 
 
-def predict_movie(model, brightfield, cell_labels, table: pd.DataFrame,
+def predict_movie(model, brightfield, cell_labels, table: Optional[pd.DataFrame],
                   cfg: DatasetConfig, position: str = "pos0",
                   progress: bool = True, **kw) -> np.ndarray:
+    """``table`` may be None: geometry is then derived from the cell masks."""
+    if table is None:
+        table = cell_table_from_masks(cell_labels, position)
     frames = []
     T = len(cell_labels)
     for t in range(T):
@@ -126,7 +148,7 @@ def predict_movie(model, brightfield, cell_labels, table: pd.DataFrame,
 
 # --------------------------------------------------------------------------
 def rank_for_annotation(table: pd.DataFrame, metrics: Optional[pd.DataFrame] = None,
-                        n: int = 200) -> pd.DataFrame:
+                        n: int = 200, frame_stride: int = 1) -> pd.DataFrame:
     """Rank cells by how much a hand-drawn label would be worth.
 
     Annotate where the automatic pipeline is uncertain or wrong, not at random:
@@ -136,26 +158,44 @@ def rank_for_annotation(table: pd.DataFrame, metrics: Optional[pd.DataFrame] = N
       2. rejected cells with good GFP signal - the pipeline failed on a cell
          that clearly has a nucleus, so it is a real failure mode
       3. cells whose auto label disagrees most with the geometric baseline
-      4. borderline two-nucleus calls
+      4. borderline bridge / two-nucleus calls (``split_borderline`` from the
+         neck ratio) and cells the bleed-through guards rejected
 
     Pass ``metrics`` (from :func:`validate.per_cell_metrics` against the
-    baseline) to enable rule 3.
+    baseline) to enable rule 3. ``frame_stride`` keeps every k-th frame only:
+    consecutive frames of one dividing cell are near-duplicates, and without
+    thinning the top of the list is 200 frames of the same ten cells.
     """
     t = table.copy()
+    if frame_stride > 1:
+        t = t[t["frame"] % frame_stride == 0]
+    t = t.reset_index(drop=True)
     priority = np.zeros(len(t))
     priority += 4.0 * (t["condition"] == "anaphase_bridge")
     priority += 2.0 * (t["condition"] == "two_nuclei")
+    if "split_borderline" in t.columns:
+        priority += 3.0 * t["split_borderline"].astype(bool)
     good_signal = t["gfp_snr"].fillna(0) > t["gfp_snr"].median()
-    priority += 3.0 * (~t["qc_pass"] & good_signal)
-    priority += 1.5 * t["reject_reason"].isin(["too_many_nuclei", "no_nucleus"])
+    priority += 3.0 * (~t["qc_pass"].astype(bool) & good_signal)
+    priority += 1.5 * t["reject_reason"].isin(
+        ["too_many_nuclei", "no_nucleus", "edge_bleed", "asymmetric_nuclei"])
 
     if metrics is not None and "iou" in metrics.columns:
+        # align by key lookup, never by merge: a merge re-orders / duplicates
+        # rows when metrics lack a column of the key or carry duplicate keys,
+        # and the positional priority array would then be added to the wrong
+        # cells
         keys = [c for c in ("position", "frame", "cell_id") if c in metrics.columns]
-        t = t.merge(metrics[keys + ["iou"]], on=keys, how="left")
-        priority = priority[:len(t)] + 2.0 * (1.0 - t["iou"].fillna(0.5))
+        if "position" in t.columns and "position" not in keys and t["position"].nunique() > 1:
+            raise ValueError("metrics has no 'position' column but table spans "
+                             "several positions - ambiguous join")
+        lut = metrics.drop_duplicates(keys).set_index(keys)["iou"]
+        idx = pd.MultiIndex.from_frame(t[keys]) if len(keys) > 1 else t[keys[0]]
+        iou = lut.reindex(idx).to_numpy(dtype=float)
+        priority += 2.0 * (1.0 - np.nan_to_num(iou, nan=0.5))
 
     t["annotation_priority"] = priority
     cols = ["position", "frame", "cell_id", "condition", "reject_reason",
-            "gfp_snr", "annotation_priority"]
+            "split_borderline", "nuc_neck_ratio", "gfp_snr", "annotation_priority"]
     cols = [c for c in cols if c in t.columns]
     return t.sort_values("annotation_priority", ascending=False).head(n)[cols]

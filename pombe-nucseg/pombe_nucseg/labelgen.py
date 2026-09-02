@@ -24,6 +24,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from scipy import ndimage as ndi
+from skimage.feature import peak_local_max
 from skimage.filters import threshold_otsu, laplace
 from skimage.measure import label as cc_label, regionprops
 from skimage.morphology import disk
@@ -33,6 +34,7 @@ from .config import LabelGenConfig
 __all__ = [
     "frame_background",
     "focus_score",
+    "neck_ratio",
     "generate_labels_frame",
     "generate_labels_movie",
 ]
@@ -53,9 +55,13 @@ def frame_background(gfp: np.ndarray, cell_mask: np.ndarray,
     if outside.size < 100:
         outside = gfp.ravel()
     bg = float(np.percentile(outside, percentile))
-    # robust sigma from the lower half of the background distribution
-    lo = outside[outside <= np.percentile(outside, 50)]
-    sigma = float(np.std(lo)) if lo.size > 10 else float(np.std(outside))
+    # robust sigma: 1.4826 * MAD. (The std of the lower half of a Gaussian is
+    # ~0.6 sigma, so a half-distribution std understates noise and inflates
+    # every SNR by ~1.65x.)
+    med = np.median(outside)
+    sigma = 1.4826 * float(np.median(np.abs(outside - med)))
+    if sigma <= 0:
+        sigma = float(np.std(outside))
     return bg, max(sigma, 1e-6)
 
 
@@ -88,6 +94,40 @@ def _remove_small(binary: np.ndarray, min_size: int) -> np.ndarray:
     return keep[lab]
 
 
+def neck_ratio(g: np.ndarray, mask: np.ndarray, min_peak_sep_px: int,
+               rel_peak: float = 0.3, iters: int = 12) -> float:
+    """Saddle-to-peak intensity ratio between the two brightest GFP maxima.
+
+    1.0 = one blob (no second maximum, or no waist); 0.0 = fully separated.
+    Found by binary-searching the threshold at which the two maxima become
+    one connected component, i.e. the intensity of the mountain pass between
+    them. Threshold-free, so it does not inherit Otsu's arbitrariness: on
+    synthetic dumbbells it tracks bridge intensity with sd ~0.01 while the
+    Otsu component count flips between 1 and 2 under a +/-20% threshold change.
+    """
+    gm = np.where(mask, g, 0.0).astype(np.float32)
+    if not mask.any() or gm.max() <= 0:
+        return 1.0
+    pk = peak_local_max(gm, min_distance=max(int(min_peak_sep_px), 1),
+                        num_peaks=2, labels=mask.astype(np.int32),
+                        threshold_abs=rel_peak * float(gm.max()))
+    if len(pk) < 2:
+        return 1.0
+    a, b = tuple(pk[0]), tuple(pk[1])
+    lo_peak = float(min(gm[a], gm[b]))
+    if lo_peak <= 0:
+        return 1.0
+    lo, hi = 0.0, lo_peak
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        lab, _ = ndi.label((gm > mid) & mask)
+        if lab[a] > 0 and lab[a] == lab[b]:
+            lo = mid            # still connected: the saddle is higher
+        else:
+            hi = mid
+    return float(lo / lo_peak)
+
+
 # --------------------------------------------------------------------------
 # per-cell segmentation
 # --------------------------------------------------------------------------
@@ -107,13 +147,17 @@ def _threshold_cell(gfp_cell: np.ndarray, cfg: LabelGenConfig,
         return np.inf
 
 
-def _classify(props: List, cfg: LabelGenConfig) -> str:
-    """Assign a condition class from the accepted nuclear components."""
+def _classify(props: List, cfg: LabelGenConfig, neck: float = 0.0) -> str:
+    """Assign a condition class from the accepted nuclear components.
+
+    Two components whose saddle intensity is still above the borderline band
+    were cut by the threshold, not by biology: call them a bridge.
+    """
     n = len(props)
     if n == 0:
         return "reject"
     if n >= 2:
-        return "two_nuclei"
+        return "anaphase_bridge" if neck >= cfg.neck_borderline[1] else "two_nuclei"
     p = props[0]
     minor = max(p.axis_minor_length, 1e-6)
     aspect = p.axis_major_length / minor
@@ -209,6 +253,10 @@ def generate_labels_frame(
             "nuc_x": np.nan,
             "nuc_solidity": np.nan,
             "nuc_aspect": np.nan,
+            "nuc_neck_ratio": np.nan,
+            "split_borderline": False,
+            "nuc_cyto_ratio": np.nan,
+            "outside_ratio": np.nan,
             "gfp_snr": np.nan,
             "condition": "reject",
             "qc_pass": False,
@@ -271,8 +319,52 @@ def generate_labels_frame(
             row["reject_reason"] = "too_many_nuclei"
             rows.append(row)
             continue
+        if len(props) == 2 and props[1].area < cfg.min_daughter_area_ratio * props[0].area:
+            row["reject_reason"] = "asymmetric_nuclei"
+            rows.append(row)
+            continue
 
-        condition = _classify(props, cfg)
+        nuc = np.isin(comp, [p.label for p in props])
+
+        # -- bleed-through guards --------------------------------------------
+        # (a) nucleus vs rest-of-cell contrast. Haze from a bright neighbour
+        #     is a shallow gradient, so Otsu's "foreground" is barely brighter
+        #     than its "background".
+        cyto = interior & ~nuc
+        nuc_med = float(np.median(g[nuc]))
+        cyto_med = float(np.median(g[cyto])) if cyto.any() else 0.0
+        row["nuc_cyto_ratio"] = nuc_med / max(cyto_med, bg_sigma)
+        if row["nuc_cyto_ratio"] < cfg.min_nuc_cyto_ratio:
+            row["reject_reason"] = "low_nuc_contrast"
+            rows.append(row)
+            continue
+        # (b) does the signal continue across the cell boundary? A real
+        #     nucleus sits >= 1 um inside the cortex, so the ring just outside
+        #     the cell next to it is empty or at background. A false nucleus
+        #     hugging the side facing a bright neighbour has haze there.
+        reach = sc["erode_cell_px"] + 3
+        r0, c0 = max(0, minr - reach), max(0, minc - reach)
+        r1, c1 = min(H, maxr + reach), min(W, maxc + reach)
+        big_nuc = np.zeros((r1 - r0, c1 - c0), dtype=bool)
+        big_nuc[minr - r0:maxr - r0, minc - c0:maxc - c0] = nuc
+        ring = (ndi.binary_dilation(big_nuc, iterations=reach)
+                & (cell_labels[r0:r1, c0:c1] == 0))
+        if ring.any():
+            row["outside_ratio"] = float(np.median(gfp_smooth[r0:r1, c0:c1][ring])) / max(nuc_med, 1e-6)
+            if row["outside_ratio"] > cfg.max_outside_ratio:
+                row["reject_reason"] = "edge_bleed"
+                rows.append(row)
+                continue
+        else:
+            row["outside_ratio"] = 0.0
+
+        # -- split stability -------------------------------------------------
+        neck = neck_ratio(g, interior, cfg.neck_min_peak_sep_um / cfg.pixel_size_um)
+        row["nuc_neck_ratio"] = neck
+        lo_b, hi_b = cfg.neck_borderline
+        row["split_borderline"] = bool(lo_b <= neck <= hi_b)
+
+        condition = _classify(props, cfg, neck)
         total_area = float(sum(p.area for p in props))
         big = props[0]
         row.update(

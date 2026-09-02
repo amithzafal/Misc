@@ -35,7 +35,13 @@ class LabelGenConfig:
     max_nuclei_per_cell: int = 2
 
     # ---- QC ----------------------------------------------------------------
-    min_gfp_snr: float = 3.0               # (p99.5 - bg) / bg_std inside cell
+    min_gfp_snr: float = 3.0               # (p99.5 - bg) / bg_sigma inside cell (sigma = MAD-based)
+    # Bleed-through guards. The SNR gate alone passes a dark cell next to a
+    # bright one (haze from the neighbour is well above background noise).
+    min_nuc_cyto_ratio: float = 1.5        # median(GFP in nucleus) / median(GFP in rest of cell)
+    max_outside_ratio: float = 0.5         # median(GFP just outside the cell next to the nucleus)
+                                           # / median(GFP in nucleus); higher = haze continues
+                                           # across the cell boundary = neighbour's signal
     min_focus_score: Optional[float] = None   # set after calibrating on your data
     min_cell_area_um2: float = 3.0
     border_margin_px: int = 2              # reject cells touching frame edge
@@ -44,6 +50,15 @@ class LabelGenConfig:
     # A single elongated / waisted object = anaphase bridge (closed mitosis).
     anaphase_aspect_min: float = 1.7
     anaphase_solidity_max: float = 0.92
+    # Pombe divides symmetrically: two "nuclei" of very different size are a
+    # nucleus plus debris / a vacuole / a merged cell mask, not two daughters.
+    min_daughter_area_ratio: float = 0.35
+    # Bridge / two-nuclei split stability. ``neck_ratio`` = GFP intensity at the
+    # saddle between the two lobes / the dimmer lobe peak (1.0 = no waist,
+    # 0.0 = fully separated). It is threshold-free; the Otsu call flips at
+    # roughly 0.4, so calls inside this band are marked ``split_borderline``.
+    neck_borderline: Tuple[float, float] = (0.25, 0.6)
+    neck_min_peak_sep_um: float = 1.0      # two maxima closer than this are one lobe
 
     def scaled(self) -> Dict[str, float]:
         """Micron-valued parameters converted to pixels."""
@@ -82,6 +97,9 @@ class DatasetConfig:
 
     # Cap so a handful of manual anaphase crops cannot dominate a batch.
     max_sample_weight: float = 40.0
+    # Auto labels flagged ``split_borderline`` encode where Otsu happened to
+    # break the bridge. Down-weight them (0 = drop) until they are hand-drawn.
+    borderline_auto_weight: float = 0.25
 
 
 @dataclass
@@ -96,6 +114,7 @@ class TrainConfig:
     val_fraction: float = 0.0       # prefer explicit position-level splits
     num_workers: int = 4
     amp: bool = True
+    grad_clip: float = 1.0          # max grad norm; 0 disables
     seed: int = 0
 
     # How sample weights enter training.
