@@ -75,7 +75,7 @@ number of RITS/CLRC or Dcr1/RDRC complexes) removes that compensation:
 | S_sat_proc = 1, S_sat_meth = 5 | 1.0 | 3.8 | 3.8 | 1.2 | 0.08 |
 | scan optimum: S_sat_proc ≈ 0.6, S_sat_meth ≈ 7 | 0.9 | 3.1 | 3.2 | 1.1 | 0.008 |
 
-Saturation of methylation is the essential part: with S_sat_meth below about 2, WT can no longer stay silent.
+Saturation of methylation is the essential part: with S_sat_meth below about 1, WT can no longer stay silent.
 A *threshold* (S_c, a critical siRNA number) does not fix R406H. It acts at low S, but
 the compensation that has to be removed happens at high S.
 
