@@ -58,6 +58,17 @@ class Params:
     eps_s: float = 0.002    # siRNA/RITS-guided methylation (eps_spread)
     eps_m: float = 0.005    # read-write (Clr4 chromodomain) methylation (eps_RW)
     N: int = 30             # nucleosomes in the dh locus (sets size of M noise)
+    # --- optional siRNA nonlinearities (defaults = original mass-action model) ---
+    # siRNA "activity" phi(S) = S * S^h/(S_c^h + S^h) / (1 + S/S_sat)
+    #   S_c   : critical siRNA number (cooperative threshold); 0 = no threshold
+    #   S_sat : saturation (limited RITS / RDRC / Clr4 recruitment); inf = none
+    # phi_p (with *_proc) replaces S in the RNA->siRNA processing term gamma R M S,
+    # phi_m (with *_meth) replaces S in the siRNA-guided methylation terms.
+    S_c_proc: float = 0.0
+    S_sat_proc: float = np.inf
+    S_c_meth: float = 0.0
+    S_sat_meth: float = np.inf
+    h: float = 2.0
 
     def with_(self, **kw) -> "Params":
         return replace(self, **kw)
@@ -65,7 +76,13 @@ class Params:
     def as_array(self) -> np.ndarray:
         return np.array([self.T, self.K, self.k, self.gamma, self.nu, self.d1,
                          self.d2, self.d3, self.eps0, self.eps_s, self.eps_m,
-                         float(self.N)])
+                         float(self.N), self.S_c_proc, self.S_sat_proc,
+                         self.S_c_meth, self.S_sat_meth, self.h])
+
+    @property
+    def linear(self) -> bool:
+        return (self.S_c_proc == 0 and self.S_c_meth == 0
+                and np.isinf(self.S_sat_proc) and np.isinf(self.S_sat_meth))
 
 
 # --------------------------------------------------------------------------
@@ -103,12 +120,22 @@ def transcription(M, p: Params):
     return p.T / (1.0 + (M / p.K) ** p.k)
 
 
+def phi(S, S_c, S_sat, h):
+    """siRNA activity: S, optionally with a cooperative threshold and saturation."""
+    out = S / (1.0 + S / S_sat)
+    if S_c > 0:
+        Sp = np.maximum(S, 0.0) ** h
+        out = out * Sp / (S_c ** h + Sp)
+    return out
+
+
 def rhs(t, y, p: Params):
     R, S, M = y
-    conv = p.gamma * R * M * S
+    conv = p.gamma * R * M * phi(S, p.S_c_proc, p.S_sat_proc, p.h)
+    Sm = phi(S, p.S_c_meth, p.S_sat_meth, p.h)
     dR = transcription(M, p) - p.d1 * R - conv
     dS = conv + p.nu * R - p.d2 * S
-    dM = (1.0 - M) * (p.eps0 * R + p.eps_s * R * S + p.eps_m * R * S * M) - p.d3 * M
+    dM = (1.0 - M) * (p.eps0 * R + p.eps_s * R * Sm + p.eps_m * R * Sm * M) - p.d3 * M
     return np.array([dR, dS, dM])
 
 
@@ -170,8 +197,32 @@ def _RS_given_M_vec(Ms, p: Params, iters=80):
     return R, p.nu * R / (p.d2 - gM * R)
 
 
+def _fixed_points_multistart(p: Params):
+    """Stable steady states by integrating from a spread of initial conditions
+    (used when the siRNA terms are nonlinear; unstable states are not returned)."""
+    found = []
+    f0 = p.T / p.d1
+    for M0 in (0.0, 0.1, 0.3, 0.6, 1.0):
+        for S0 in (0.0, 1.0, 10.0, 100.0):
+            for R0 in (0.0, f0):
+                sol = solve_ivp(rhs, (0, 2e5), [R0, S0, M0], args=(p,), method="LSODA",
+                                rtol=1e-8, atol=1e-10)
+                y = sol.y[:, -1]
+                if np.abs(rhs(0, y, p)).max() > 1e-7:
+                    continue
+                if all(np.abs(y - np.array([q["R"], q["S"], q["M"]])).max() >
+                       1e-3 * (1 + np.abs(y).max()) for q in found):
+                    ev = np.linalg.eigvals(_jacobian(y, p))
+                    found.append(dict(R=y[0], S=y[1], M=y[2],
+                                      stable=bool(np.all(ev.real < 0))))
+    return found
+
+
 def fixed_points(p: Params, n_grid=3000):
-    """All steady states (R, S, M, stable) found by scanning M in [0, 1)."""
+    """All steady states (R, S, M, stable) found by scanning M in [0, 1).
+    For nonlinear siRNA terms, falls back to multistart integration (stable only)."""
+    if not p.linear:
+        return _fixed_points_multistart(p)
     Ms = np.concatenate([[0.0], np.logspace(-8, np.log10(0.999999), n_grid)])
 
     def g_of(M, R, S):
@@ -231,7 +282,7 @@ def calibrate_gamma(p: Params, target_R=1.0, lo=1e-5, hi=10.0):
 # Gillespie SSA
 # --------------------------------------------------------------------------
 def _ssa_cell(par, R, S, n, t_sample, seed):
-    T, K, k, gamma, nu, d1, d2, d3, eps0, eps_s, eps_m, Nf = par
+    T, K, k, gamma, nu, d1, d2, d3, eps0, eps_s, eps_m, Nf, Scp, Ssp, Scm, Ssm, h = par
     N = int(Nf)
     np.random.seed(seed)
     out = np.empty((t_sample.shape[0], 3))
@@ -240,12 +291,18 @@ def _ssa_cell(par, R, S, n, t_sample, seed):
     a = np.empty(7)
     while j < t_sample.shape[0]:
         M = n / N
+        Sp = S / (1.0 + S / Ssp)
+        Sm = S / (1.0 + S / Ssm)
+        if Scp > 0:
+            Sp *= S ** h / (Scp ** h + S ** h)
+        if Scm > 0:
+            Sm *= S ** h / (Scm ** h + S ** h)
         a[0] = T / (1.0 + (M / K) ** k)
         a[1] = d1 * R
-        a[2] = gamma * R * M * S
+        a[2] = gamma * R * M * Sp
         a[3] = nu * R
         a[4] = d2 * S
-        a[5] = (N - n) * R * (eps0 + eps_s * S + eps_m * S * M)
+        a[5] = (N - n) * R * (eps0 + eps_s * Sm + eps_m * Sm * M)
         a[6] = d3 * n
         a0 = a.sum()
         t_next = t + np.random.exponential(1.0 / a0)

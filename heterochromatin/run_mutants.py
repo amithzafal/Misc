@@ -10,9 +10,6 @@ import argparse
 import os
 
 import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 
 from analysis import (evaluate_mutants, score, ssa_calibrate_gamma, parse_set,
@@ -28,7 +25,11 @@ ap.add_argument("--cells", type=int, default=1000)
 ap.add_argument("--data-dir", help="folder with <mutant>.txt per-cell counts")
 ap.add_argument("--out", default="mutants.png")
 ap.add_argument("--seed", type=int, default=0)
+ap.add_argument("--show", action="store_true", help="open the figure window")
 a = ap.parse_args()
+if not a.show:
+    matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402  (backend chosen above)
 
 p = Params().with_(**parse_set(a.set))
 if a.gamma is not None:
@@ -73,11 +74,17 @@ for ax, m in zip(axs, MUTANTS):
             ll = log_likelihood(c, tr)
             print(f"{m}: data mean {c.mean():.2f} (n={c.size}), log-lik/cell {ll:.3f}")
             title += f"\ndata={c.mean():.2f}"
+    if TARGET_MEAN_R[m] is not None:
+        ax.axvline(TARGET_MEAN_R[m], color="k", ls="--", lw=1, label="target mean")
+    ax.axvline(res[m]["ssa"]["R_mean"], color="0.3", lw=1.5, label="SSA mean")
     ax.set_title(title, fontsize=9)
     ax.set_xlabel("dh RNA / cell")
     ax.set_xlim(-0.5, 40)
 axs[0].set_ylabel("probability")
 axs[0].legend(fontsize=8)
+fig.suptitle(", ".join(f"{k}={v:.3g}" for k, v in vars(p).items()), fontsize=7)
 fig.tight_layout()
 fig.savefig(a.out, dpi=130)
 print("saved", a.out)
+if a.show:
+    plt.show()

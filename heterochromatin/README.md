@@ -25,6 +25,9 @@ Parameter mapping: `eps0` = eps_nuc (1e-5), `eps_s` = eps_spread (0.002),
 All mutants start from the WT silent state and relax to their own stationary state. Statistics are
 snapshots pooled over cells and over 10 time points after burn-in, as smFISH would sample them.
 
+Optional siRNA nonlinearities (they default off, which is the original model). `phi(S) = S * S^h/(S_c^h+S^h) / (1+S/S_sat)` replaces S in
+processing (`S_c_proc`, `S_sat_proc`) and/or in siRNA-guided methylation (`S_c_meth`, `S_sat_meth`).
+
 ## Files
 - `model.py`: parameters, mutants, ODE, every fixed point and its stability, and the numba Gillespie.
 - `analysis.py`: SSA calibration of gamma (sets mean WT RNA to 1), mutant evaluation, score, and smFISH loading and likelihood.
@@ -35,9 +38,12 @@ snapshots pooled over cells and over 10 time points after burn-in, as smFISH wou
 pip install -r requirements.txt
 python run_mutants.py                                   # default params, gamma calibrated by SSA
 python run_mutants.py --set eps_m=0.01 N=50 --epe1-factor 0.3
+python run_mutants.py --set S_sat_proc=1 S_sat_meth=5 --epe1-factor 0.5   # saturating model
 python run_mutants.py --data-dir smfish/                # overlay smFISH: smfish/wt.txt, r406h.txt, ...
 python phase_diagram.py --x eps_m:1e-4:0.1:12 --y gamma:3e-3:1:12
 python phase_diagram.py --x eps_m:1e-4:0.1:8 --y epe1_factor:0.03:1:8 --calibrate
+python phase_diagram.py --x S_sat_proc:0.3:30:8 --y S_sat_meth:0.5:50:8 --calibrate --epe1-factor 0.5
+# add --show to either script to open the figure window
 ```
 smFISH files contain one count per cell, one per line (CSV first column, header allowed).
 
@@ -55,3 +61,24 @@ smFISH files contain one count per cell, one per line (CSV first column, header 
 3. **The model can derepress epe1Δ.** Less demethylation means higher M, less transcription,
    fewer siRNAs, and then siRNA extinction. epe1Δ comes out near 3–14 RNA depending on
    `epe1_factor`. The best scan point is eps_m ≈ 3e-4 and epe1_factor ≈ 0.6 (see `results/`).
+
+## Missing mechanism: siRNA saturation (`results/mutants_saturating.png`, `results/phase_saturation.png`)
+In the mass-action model, the siRNA pool compensates for any loss of writer activity. Weaker
+Clr4 means lower M and more transcription; that makes more siRNA, which drives eps_s R S methylation
+back up and also holds R at d2/(gamma M). Making both siRNA-dependent steps **saturate** (a limited
+number of RITS/CLRC or Dcr1/RDRC complexes) removes that compensation:
+
+| model (gamma refit, epe1_factor 0.5) | WT | R406H | epe1Δ | W31G | score |
+|---|---|---|---|---|---|
+| mass action | 1.5 | 0.5 | 9.0 | 0.4 | 2.6 |
+| S_sat_meth = 5 only | 1.0 | 1.9 | 10.5 | 0.8 | 1.5 |
+| S_sat_proc = 1, S_sat_meth = 5 | 1.0 | 3.8 | 3.8 | 1.2 | 0.08 |
+| scan optimum: S_sat_proc ≈ 0.6, S_sat_meth ≈ 7 | 0.9 | 3.1 | 3.2 | 1.1 | 0.008 |
+
+Saturation of methylation is the essential part: with S_sat_meth below about 2, WT can no longer stay silent.
+A *threshold* (S_c, a critical siRNA number) does not fix R406H. It acts at low S, but
+the compensation that has to be removed happens at high S.
+
+Prediction to test against smFISH: R406H derepression is graded (unimodal, Fano about 2), whereas epe1Δ
+derepression is stochastic loss of siRNAs in about 17% of cells. That gives a bimodal distribution with a
+mode at 0 and a tail near 20 (Fano about 15); the ODE alone predicts no epe1Δ derepression.

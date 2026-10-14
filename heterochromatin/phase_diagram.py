@@ -17,9 +17,6 @@ import argparse
 import time
 
 import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 
 from analysis import evaluate_mutants, score, ssa_calibrate_gamma, parse_set
@@ -36,7 +33,11 @@ ap.add_argument("--calibrate", action="store_true",
                 help="re-fit gamma at each point so that <R>_WT = 1 (slower)")
 ap.add_argument("--cells", type=int, default=200)
 ap.add_argument("--out", default="phase")
+ap.add_argument("--show", action="store_true", help="open the figure window")
 a = ap.parse_args()
+if not a.show:
+    matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402  (backend chosen above)
 
 
 def axis(spec):
@@ -124,3 +125,5 @@ print(f"best: {xn}={xs[k[1]]:.4g}, {yn}={ys[k[0]]:.4g}"
       + ("" if "gamma" in (xn, yn) else f", gamma={gam[k]:.4g}") + f", score={sc[k]:.3f}")
 print(" ".join(f"{m}={R[m][k]:.2f}" for m in SCAN_MUTANTS))
 print("saved", a.out + ".png", a.out + ".npz")
+if a.show:
+    plt.show()
