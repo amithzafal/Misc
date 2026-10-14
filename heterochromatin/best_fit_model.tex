@@ -1,0 +1,49 @@
+% Best-fit (saturating siRNA) model -- fitted to smFISH mean dh RNA per strain
+% (fit.py, results/fit_saturating.json)
+
+\begin{equation}
+\frac{dR}{dt}= \frac{T}{1 + (M/K)^k} - \delta_1 R - \gamma R M \,\frac{S}{1 + S/S_p}
+\label{R}
+\end{equation}
+
+\begin{equation}
+\frac{dS}{dt}= \gamma R M \,\frac{S}{1 + S/S_p} + \nu R - \delta_2 S
+\label{S}
+\end{equation}
+
+\begin{equation}
+\frac{dM}{dt}= (1-M)\left[\epsilon_0 R + \left(\epsilon_s + \epsilon_m M\right) R \,\frac{S}{1 + S/S_m}\right] - \delta_3 M
+\label{M}
+\end{equation}
+
+% S_p, S_m -> infinity recovers the original mass-action model.
+% Stochastic version: M = n/N with N nucleosomes; R, S, n integer; 7 reactions
+% (transcription, RNA decay, RNA->siRNA, nu R, siRNA decay, methylation, demethylation).
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llcl}
+\hline
+Parameter & Description & Value & Source \\
+\hline
+$T$ & total transcript output per min & $1.14$ $\text{min}^{-1}$ & clr4$\Delta$ mean: $T=\delta_1\langle R\rangle_{\text{clr4}\Delta}$ \\
+$K$ & threshold of transcriptional switching, half repression & $0.2$ & fixed \\
+$k$ & Hill coefficient & $4$ & fixed \\
+$\gamma$ & RNA $\to$ siRNA processing (RITS/RDRC/Dcr1) & $0.119$ $\text{min}^{-1}$ & fitted \\
+$S_p$ & siRNA saturation of processing & $2.77$ molecules & fitted \\
+$\nu$ & methylation-independent siRNA production & $10^{-5}$ $\text{min}^{-1}$ & fixed \\
+$\delta_1$ & RNA decay rate & $0.05$ $\text{min}^{-1}$ & fixed \\
+$\delta_2$ & siRNA decay rate & $0.005$ $\text{min}^{-1}$ & fixed \\
+$\delta_3$ & M decay rate (Epe1) & $0.015$ $\text{min}^{-1}$ & fixed \\
+$\epsilon_0$ & methylation nucleation & $5.05\times10^{-4}$ & fitted \\
+$\epsilon_s$ & siRNA (RITS)-guided methylation & $4.95\times10^{-5}$ & fitted \\
+$\epsilon_m$ & read-write (Clr4 chromodomain) methylation & $7.25\times10^{-2}$ & fitted \\
+$S_m$ & siRNA saturation of methylation & $1.26$ molecules & fitted \\
+$N$ & nucleosomes in dh locus (SSA only) & $30$ & fixed \\
+\hline
+\end{tabular}
+\caption{Best-fit parameters. Fit to mean dh RNA/cell (Gillespie, 300 cells $\times$ 10 snapshots).
+Data vs model: WT $0.84$ vs $0.84$; R406H ($\epsilon_i/10$) $2.44$ vs $2.44$;
+W31G ($\epsilon_m=0$) $6.14$ vs $6.13$; clr4$\Delta$ ($\epsilon_i=0$) $22.8$ vs $22.8$ (exact).
+Six fitted parameters against three independent means: the fit is not unique.}
+\end{table}
