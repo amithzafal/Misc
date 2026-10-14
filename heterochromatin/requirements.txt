@@ -1,0 +1,4 @@
+numpy
+scipy
+matplotlib
+numba  # optional, ~100x faster SSA
