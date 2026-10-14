@@ -32,6 +32,8 @@ processing (`S_c_proc`, `S_sat_proc`) and/or in siRNA-guided methylation (`S_c_m
 - `model.py`: parameters, mutants, ODE, every fixed point and its stability, and the numba Gillespie.
 - `analysis.py`: SSA calibration of gamma (sets mean WT RNA to 1), mutant evaluation, score, and smFISH loading and likelihood.
 - `run_mutants.py`: calibrates, prints an ODE-vs-SSA table, and plots RNA histograms.
+- `fit.py`: fits the mean RNA of each mutant (the shift, not the shape) to the smFISH data. T is fixed by the clr4Δ mean.
+- `plot_shift.py`: compares the fitted means with the data.
 - `phase_diagram.py`: 2D scan over any two parameters (or `epe1_factor`), optionally re-calibrating gamma at each point.
 
 ```bash
@@ -45,7 +47,14 @@ python phase_diagram.py --x eps_m:1e-4:0.1:8 --y epe1_factor:0.03:1:8 --calibrat
 python phase_diagram.py --x S_sat_proc:0.3:30:8 --y S_sat_meth:0.5:50:8 --calibrate --epe1-factor 0.5
 # add --show to either script to open the figure window
 ```
-smFISH files contain one count per cell, one per line (CSV first column, header allowed).
+smFISH files go in `data/<mutant>.csv` (`cell_id,ch0_spots,ch1_spots`; `ch0_spots` is used) or
+as plain text with one count per line. `data/` and `results/fit_*` are gitignored (this repo is public).
+
+```bash
+python fit.py                                  # fit the mean shifts with the saturating model
+python fit.py --free gamma eps0 eps_s eps_m    # same for the original mass-action model
+python plot_shift.py                           # data vs fitted means -> results/fit_shift.png
+```
 
 ## First observations (default parameters)
 1. **In the silent state, R is set by the siRNA loop.** Setting dS/dt = 0 with nu ≈ 0 gives
@@ -82,3 +91,13 @@ the compensation that has to be removed happens at high S.
 Prediction to test against smFISH: R406H derepression is graded (unimodal, Fano about 2), whereas epe1Δ
 derepression is stochastic loss of siRNAs in about 17% of cells. That gives a bimodal distribution with a
 mode at 0 and a tail near 20 (Fano about 15); the ODE alone predicts no epe1Δ derepression.
+
+## Fit to smFISH means (WT 0.84, R406H 2.44, W31G 6.14, clr4Δ 22.8)
+Only the mean of each distribution is fitted, not its shape. T = 22.8 × d1 comes from clr4Δ.
+- **Mass action** (gamma, eps0, eps_s, eps_m free): best score 0.59. It cannot make W31G as
+  derepressed as observed (2.9 vs 6.1) while keeping WT low (1.4 vs 0.84).
+- **Saturating** (also S_sat_proc and S_sat_meth free): all four means are matched (score below 1e-4).
+  The fitted values are eps_m ≈ 0.07, eps_s ≈ 5e-5, eps0 ≈ 5e-4, gamma ≈ 0.12, S_sat_proc ≈ 2.8 and S_sat_meth ≈ 1.3.
+  Read-write (eps_m) dominates methylation, which is why losing it in W31G derepresses more than
+  the 10× catalytic loss in R406H. This fit is not unique: 6 parameters are fitted to 3 means.
+- With these values and epe1_factor = 0.5, the predicted epe1Δ mean is about 4.

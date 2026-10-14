@@ -91,18 +91,35 @@ def score(res, targets=TARGET_MEAN_R, key="ssa"):
 # --------------------------------------------------------------------------
 # smFISH data (to be supplied): per-cell RNA counts for each mutant
 # --------------------------------------------------------------------------
-def load_counts(path):
-    """Per-cell dh RNA counts: a text/CSV file with one integer per line
-    (a header line is skipped automatically)."""
-    vals = []
+def load_counts(path, column="ch0_spots"):
+    """Per-cell dh RNA counts from a CSV with a header containing `column`
+    (e.g. cell_id,ch0_spots,ch1_spots), or a plain file with one count per line."""
+    import csv
     with open(path) as fh:
+        first = fh.readline()
+        fh.seek(0)
+        if column in first:
+            return np.array([int(float(r[column])) for r in csv.DictReader(fh)], int)
+        vals = []
         for line in fh:
-            tok = line.strip().split(",")[0]
             try:
-                vals.append(int(round(float(tok))))
+                vals.append(int(round(float(line.strip().split(",")[0]))))
             except ValueError:
                 continue
     return np.array(vals, int)
+
+
+def load_dataset(folder, mutants=MUTANTS):
+    """{mutant: counts} for every <mutant>.csv / <mutant>.txt present in folder."""
+    import os
+    out = {}
+    for m in mutants:
+        for ext in (".csv", ".txt"):
+            f = os.path.join(folder, m + ext)
+            if os.path.exists(f):
+                out[m] = load_counts(f)
+                break
+    return out
 
 
 def log_likelihood(counts, traj, pseudo=1e-4):

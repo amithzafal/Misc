@@ -1,3 +1,5 @@
 __pycache__/
 *.nbi
 *.nbc
+data/
+results/fit_*

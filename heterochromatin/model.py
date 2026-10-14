@@ -109,8 +109,9 @@ def mutant_params(p: Params, mutant: str, epe1_factor: float = 0.1,
 
 MUTANTS = ["wt", "r406h", "clr4d", "epe1d", "w31g"]
 
-# Mean RNA/cell targets currently known (None = no constraint yet)
-TARGET_MEAN_R = {"wt": 1.0, "r406h": 3.0, "clr4d": 20.0, "epe1d": 3.0, "w31g": None}
+# Mean RNA/cell targets: smFISH means (data/*.csv, ch0) except epe1D, which is
+# the rough estimate (~3) without a distribution yet.
+TARGET_MEAN_R = {"wt": 0.84, "r406h": 2.44, "clr4d": 22.81, "epe1d": 3.0, "w31g": 6.14}
 
 
 # --------------------------------------------------------------------------

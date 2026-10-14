@@ -7,13 +7,12 @@ Examples
     python run_mutants.py --data-dir smfish/      # overlay smFISH (wt.txt, r406h.txt, ...)
 """
 import argparse
-import os
 
 import matplotlib
 import numpy as np
 
 from analysis import (evaluate_mutants, score, ssa_calibrate_gamma, parse_set,
-                      load_counts, log_likelihood)
+                      load_dataset, log_likelihood)
 from model import MUTANTS, TARGET_MEAN_R, Params, calibrate_gamma, rna_histogram
 
 ap = argparse.ArgumentParser()
@@ -59,6 +58,7 @@ for m in MUTANTS:
           f"{s['S_mean']:6.2f} {s['M_mean']:6.3f} {s['frac_silent']:6.2f}")
 print(f"score (sum sq. log error vs targets): SSA {score(res):.3f}   ODE {score(res, key='ode'):.3f}")
 
+data = load_dataset(a.data_dir) if a.data_dir else {}
 fig, axs = plt.subplots(1, len(MUTANTS), figsize=(3.2 * len(MUTANTS), 3), sharey=True)
 for ax, m in zip(axs, MUTANTS):
     tr = res[m]["traj"]
@@ -66,9 +66,8 @@ for ax, m in zip(axs, MUTANTS):
     ax.bar(np.arange(h.size), h, width=1, color="0.6", label="SSA")
     title = f"{m}  <R>={res[m]['ssa']['R_mean']:.2f}"
     if a.data_dir:
-        f = os.path.join(a.data_dir, f"{m}.txt")
-        if os.path.exists(f):
-            c = load_counts(f)
+        c = data.get(m)
+        if c is not None:
             hd = np.bincount(c, minlength=h.size)[: h.size] / c.size
             ax.step(np.arange(hd.size), hd, where="mid", color="C3", label="smFISH")
             ll = log_likelihood(c, tr)
