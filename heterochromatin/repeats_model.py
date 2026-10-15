@@ -22,7 +22,9 @@ KEYS = ["T", "K", "k", "gamma", "S_p", "nu", "d1", "d2", "d3", "eps_s", "eps_m",
         "S_m", "N", "L", "N0", "T_u", "kappa", "eps_u", "N_u", "shared"]
 
 
-def strain(name, p, epe1_factor=0.5):
+def strain(name, p, epe1_factor=0.5, epe1_writer=1.0):
+    """epe1_writer < 1: in epe1D, less Clr4 available at the centromere
+    (e.g. titrated by heterochromatin spreading elsewhere), scaling all writing."""
     p = dict(p)
     if name == "w31g":
         p.update(eps_m=0.0, eps_u=0.0)
@@ -33,6 +35,8 @@ def strain(name, p, epe1_factor=0.5):
             p[x] *= 0.1
     elif name == "epe1d":
         p["d3"] *= epe1_factor
+        for x in ("eps_s", "eps_m", "kappa", "eps_u"):
+            p[x] *= epe1_writer
     return p
 
 
