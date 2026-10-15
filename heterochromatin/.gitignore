@@ -3,3 +3,4 @@ __pycache__/
 *.nbc
 data/
 results/fit_*
+results/ura4_*
